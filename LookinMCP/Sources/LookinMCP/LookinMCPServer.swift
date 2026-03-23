@@ -30,6 +30,7 @@ public actor LookinMCPServer {
     private let configuration: Configuration
     private let dataSource: any LookinMCPDataSource
     private var channel: Channel?
+    private var eventLoopGroup: MultiThreadedEventLoopGroup?
     private var transport: StatelessHTTPServerTransport?
     private var server: Server?
     
@@ -51,8 +52,9 @@ public actor LookinMCPServer {
     
     /// 启动服务器
     public func start() async throws {
-        // 创建 Transport
+        // 创建 Transport - 使用宽松的验证规则
         transport = StatelessHTTPServerTransport(
+            validationPipeline: nil,  // 使用默认验证
             logger: logger
         )
         
@@ -81,17 +83,18 @@ public actor LookinMCPServer {
         
         // 启动 HTTP Server
         let group = MultiThreadedEventLoopGroup(numberOfThreads: System.coreCount)
+        self.eventLoopGroup = group
         
         let bootstrap = ServerBootstrap(group: group)
             .serverChannelOption(ChannelOptions.backlog, value: 256)
             .serverChannelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
             .childChannelInitializer { channel in
-                channel.pipeline.configureHTTPServerPipeline().flatMap {
+                channel.pipeline.configureHTTPServerPipeline(withErrorHandling: true).flatMap {
                     channel.pipeline.addHandler(LookinHTTPHandler(server: self))
                 }
             }
             .childChannelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
-            .childChannelOption(ChannelOptions.maxMessagesPerRead, value: 1)
+            .childChannelOption(ChannelOptions.maxMessagesPerRead, value: 16)
         
         logger.info(
             "Starting Lookin MCP Server",
@@ -106,15 +109,24 @@ public actor LookinMCPServer {
         self.channel = channel
         
         logger.info("Lookin MCP Server started on http://\(configuration.host):\(configuration.port)\(configuration.endpoint)")
-        
-        // 等待 channel 关闭 (这会阻塞直到 stop() 被调用)
-        try await channel.closeFuture.get()
+
+        // 在后台等待 channel 关闭，保持服务器运行
+        Task {
+            try? await channel.closeFuture.get()
+            await self.handleChannelClosed()
+        }
+    }
+
+    private func handleChannelClosed() {
+        logger.info("Server channel closed")
     }
     
     /// 停止服务器
     public func stop() async {
         try? await channel?.close()
         channel = nil
+        try? await eventLoopGroup?.shutdownGracefully()
+        eventLoopGroup = nil
         await transport?.disconnect()
         transport = nil
         server = nil
@@ -126,10 +138,34 @@ public actor LookinMCPServer {
     var endpoint: String { configuration.endpoint }
     
     func handleHTTPRequest(_ request: HTTPRequest) async -> HTTPResponse {
-        guard let transport = transport else {
-            return .error(statusCode: 500, .internalError("Server not initialized"))
+        // 为每个连接创建独立的 Server 和 Transport 实例
+        let transport = StatelessHTTPServerTransport(logger: logger)
+        let server = Server(
+            name: "lookin-mcp-server",
+            version: "1.0.0",
+            capabilities: Server.Capabilities(
+                tools: .init(listChanged: false)
+            )
+        )
+
+        // 注册 Tools
+        await LookinMCPToolHandler.registerTools(on: server, dataSource: dataSource)
+
+        // 启动 MCP Server
+        do {
+            try await server.start(transport: transport)
+        } catch {
+            logger.error("Failed to start MCP server: \(error)")
+            return .error(statusCode: 500, .internalError("Failed to start server"))
         }
-        return await transport.handleRequest(request)
+
+        // 处理请求
+        let response = await transport.handleRequest(request)
+
+        // 停止 Server
+        await server.stop()
+
+        return response
     }
 }
 
@@ -189,6 +225,15 @@ private final class LookinHTTPHandler: ChannelInboundHandler, @unchecked Sendabl
                 await self.handleRequest(state: state, context: ctx)
             }
         }
+    }
+
+    func channelInactive(context: ChannelHandlerContext) {
+        // Channel closed
+    }
+
+    func errorCaught(context: ChannelHandlerContext, error: Error) {
+        server.logger.error("Channel error: \(error)")
+        context.close(promise: nil)
     }
     
     private func handleRequest(state: RequestState, context: ChannelHandlerContext) async {
@@ -259,6 +304,13 @@ private final class LookinHTTPHandler: ChannelInboundHandler, @unchecked Sendabl
             )
             for (name, value) in headers {
                 head.headers.add(name: name, value: value)
+            }
+            
+            // 确保设置 Content-Length
+            if let body = bodyData {
+                head.headers.add(name: "Content-Length", value: "\(body.count)")
+            } else {
+                head.headers.add(name: "Content-Length", value: "0")
             }
             
             ctx.write(self.wrapOutboundOut(.head(head)), promise: nil)
